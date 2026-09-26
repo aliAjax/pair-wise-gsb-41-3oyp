@@ -1,6 +1,36 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>巨灾理赔调度</title>
-<style>body{font:15px/1.6 system-ui,sans-serif;max-width:1200px;margin:28px auto;padding:0 20px;color:#263746}table{border-collapse:collapse;width:100%;margin:14px 0}th,td{border:1px solid #d3dce3;padding:7px}th{background:#f1f5f7}.card{background:#fff8eb;border-left:5px solid #d58b21;padding:12px 16px}code{background:#eef2f4;padding:2px 5px}</style>
-<h1>巨灾保险理赔调度</h1><div class="card">状态页按调用角色过滤。写入接口需要 <code>X-User</code>、<code>X-Role</code>，详见 README。</div>
-<h2>优先队列</h2><table id="claims"><thead><tr><th>报案号</th><th>区域</th><th>状态</th><th>优先级</th><th>欺诈分</th><th>负责人</th></tr></thead><tbody></tbody></table>
+<style>body{font:15px/1.6 system-ui,sans-serif;max-width:1200px;margin:28px auto;padding:0 20px;color:#263746}table{border-collapse:collapse;width:100%;margin:14px 0}th,td{border:1px solid #d3dce3;padding:7px}th{background:#f1f5f7}.card{background:#fff8eb;border-left:5px solid #d58b21;padding:12px 16px}code{background:#eef2f4;padding:2px 5px}button{cursor:pointer}</style>
+<h1>巨灾保险理赔调度</h1><div class="card">状态页按调用角色过滤。写入接口需要 <code>X-User</code>、<code>X-Role</code>，详见 README。并案仅主管确认后生效：副案证据转挂主案并保留原案号，副案待办与负责人释放，副案已付预付计入主案预估损失两成上限；改判拆分后副案恢复原状态与责任，主案保留全部历史证据。</div>
+<p><label>用户 <input id="user" value="sup1"></label>
+<label>角色 <select id="role"><option value="supervisor">supervisor</option><option value="intake">intake</option><option value="adjuster">adjuster</option><option value="surveyor">surveyor</option><option value="auditor">auditor</option></select></label>
+<button onclick="load()">刷新</button></p>
+<h2>优先队列</h2><table id="claims"><thead><tr><th>报案号</th><th>区域</th><th>状态</th><th>并到主案</th><th>优先级</th><th>欺诈分</th><th>负责人</th><th>查勘员</th><th>预付/上限</th></tr></thead><tbody></tbody></table>
+<h2>并案候选（同事件同保单）</h2><table id="candidates"><thead><tr><th>主案</th><th>主案状态</th><th>副案</th><th>副案状态</th><th>副案已预付</th><th>操作</th></tr></thead><tbody></tbody></table>
+<h2>并案记录</h2><table id="merges"><thead><tr><th>主案</th><th>副案</th><th>状态</th><th>经办</th><th>时间</th><th>操作</th></tr></thead><tbody></tbody></table>
+<h2>证据</h2><table id="evidence"><thead><tr><th>当前案件</th><th>原案号</th><th>文件</th><th>来源</th><th>提交人</th></tr></thead><tbody></tbody></table>
 <h2>最近时间线</h2><ol id="timeline"></ol>
-<script>async function load(){const d=await fetch('/api/state').then(r=>r.json());document.querySelector('#claims tbody').innerHTML=d.claims.map(r=>`<tr><td>${r.claim_no}</td><td>${r.region}</td><td>${r.status}</td><td>${r.priority_score.toFixed(1)}</td><td>${r.fraud_score}</td><td>${r.assignee||''}</td></tr>`).join('');document.querySelector('#timeline').innerHTML=d.timeline.slice(0,20).map(x=>`<li>${x.created_at} ${x.action} ${x.details}</li>`).join('')}load()</script></html>
+<script>
+let claimsById={};
+const hdrs=()=>({'X-User':document.getElementById('user').value,'X-Role':document.getElementById('role').value,'Content-Type':'application/json'});
+const no=id=>claimsById[id]?claimsById[id].claim_no:(id??'');
+async function load(){
+  const d=await fetch('/api/state',{headers:hdrs()}).then(r=>r.json());
+  claimsById=Object.fromEntries((d.claims||[]).map(c=>[c.id,c]));
+  document.querySelector('#claims tbody').innerHTML=(d.claims||[]).map(r=>`<tr><td>${r.claim_no}</td><td>${r.region}</td><td>${r.status}</td><td>${r.merged_into?no(r.merged_into):''}</td><td>${r.priority_score.toFixed(1)}</td><td>${r.fraud_score}</td><td>${r.assignee||''}</td><td>${r.surveyor||''}</td><td>${r.advance_usage??r.emergency_advance}/${r.advance_limit??''}</td></tr>`).join('');
+  document.querySelector('#merges tbody').innerHTML=(d.merges||[]).map(m=>`<tr><td>${no(m.primary_claim_id)}</td><td>${no(m.secondary_claim_id)}</td><td>${m.status}</td><td>${m.actor}</td><td>${m.created_at}</td><td>${m.status==='active'?`<button onclick="doUnmerge(${m.secondary_claim_id})">改判拆分</button>`:''}</td></tr>`).join('');
+  document.querySelector('#evidence tbody').innerHTML=(d.evidence||[]).map(e=>`<tr><td>${no(e.claim_id)}</td><td>${e.origin_claim_no||''}</td><td>${e.filename}</td><td>${e.source}</td><td>${e.submitter}</td></tr>`).join('');
+  document.getElementById('timeline').innerHTML=(d.timeline||[]).slice(0,20).map(x=>`<li>${x.created_at} ${x.action} ${x.details}</li>`).join('');
+  const c=await fetch('/api/claims/merge-candidates',{headers:hdrs()});
+  const list=c.ok?(await c.json()).candidates:[];
+  document.querySelector('#candidates tbody').innerHTML=list.map(x=>`<tr><td>${x.primary_claim_no}</td><td>${x.primary_status}</td><td>${x.secondary_claim_no}</td><td>${x.secondary_status}</td><td>${x.secondary_advance}</td><td><button onclick="doMerge(${x.primary_claim_id},${x.secondary_claim_id},${x.primary_version},${x.secondary_version})">并案</button></td></tr>`).join('');
+}
+async function post(url,body){
+  const r=await fetch(url,{method:'POST',headers:hdrs(),body:JSON.stringify(body)});
+  const d=await r.json();
+  if(!r.ok)alert(d.error||'操作失败');
+  await load();
+}
+function doMerge(p,s,pv,sv){if(confirm('确认将副案并到主案？'))post('/api/claims/merge',{primary_claim_id:p,secondary_claim_id:s,expected_version:pv,secondary_version:sv});}
+function doUnmerge(sid){const c=claimsById[sid];if(c&&confirm('确认改判拆分，恢复副案原状态与责任？'))post('/api/claims/unmerge',{secondary_claim_id:sid,expected_version:c.version});}
+load();
+</script></html>
