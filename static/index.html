@@ -1,6 +1,30 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>巨灾理赔调度</title>
-<style>body{font:15px/1.6 system-ui,sans-serif;max-width:1200px;margin:28px auto;padding:0 20px;color:#263746}table{border-collapse:collapse;width:100%;margin:14px 0}th,td{border:1px solid #d3dce3;padding:7px}th{background:#f1f5f7}.card{background:#fff8eb;border-left:5px solid #d58b21;padding:12px 16px}code{background:#eef2f4;padding:2px 5px}</style>
-<h1>巨灾保险理赔调度</h1><div class="card">状态页按调用角色过滤。写入接口需要 <code>X-User</code>、<code>X-Role</code>，详见 README。</div>
-<h2>优先队列</h2><table id="claims"><thead><tr><th>报案号</th><th>区域</th><th>状态</th><th>优先级</th><th>欺诈分</th><th>负责人</th></tr></thead><tbody></tbody></table>
+<style>body{font:15px/1.6 system-ui,sans-serif;max-width:1200px;margin:28px auto;padding:0 20px;color:#263746}table{border-collapse:collapse;width:100%;margin:14px 0}th,td{border:1px solid #d3dce3;padding:7px}th{background:#f1f5f7}.card{background:#fff8eb;border-left:5px solid #d58b21;padding:12px 16px}code{background:#eef2f4;padding:2px 5px}button{padding:4px 12px;cursor:pointer}.warn{color:#b3261e;font-weight:600}.muted{color:#7a8a95}input{padding:4px 8px;margin-right:8px}</style>
+<h1>巨灾保险理赔调度</h1><div class="card">状态页按调用角色过滤。写入接口需要 <code>X-User</code>、<code>X-Role</code>，详见 README。并案归并规则、证据迁移与付款校验在 <code>merge_ops.py</code>，接口在 <code>app.py</code>。</div>
+<p><label>用户 <input id="user" size="10"></label><label>角色 <input id="role" size="12" placeholder="supervisor"></label><button onclick="saveAndLoad()">刷新</button><span id="msg" class="muted"></span></p>
+<h2>优先队列</h2><table id="claims"><thead><tr><th>报案号</th><th>区域</th><th>状态</th><th>优先级</th><th>欺诈分</th><th>负责人</th><th>并案</th><th>预付(含副案)</th></tr></thead><tbody></tbody></table>
+<h2>并案候选（主管确认后并案）</h2><table id="candidates"><thead><tr><th>主案</th><th>副案</th><th>副案状态</th><th>副案证据</th><th>副案已预付</th><th>并后预付/上限</th><th></th></tr></thead><tbody></tbody></table>
+<h2>进行中的并案</h2><table id="merges"><thead><tr><th>主案</th><th>副案原案号</th><th>并案人</th><th>并案时间</th><th></th></tr></thead><tbody></tbody></table>
+<h2>证据</h2><table id="evidence"><thead><tr><th>所属案件</th><th>原案号</th><th>文件</th><th>来源</th><th>提交人</th></tr></thead><tbody></tbody></table>
 <h2>最近时间线</h2><ol id="timeline"></ol>
-<script>async function load(){const d=await fetch('/api/state').then(r=>r.json());document.querySelector('#claims tbody').innerHTML=d.claims.map(r=>`<tr><td>${r.claim_no}</td><td>${r.region}</td><td>${r.status}</td><td>${r.priority_score.toFixed(1)}</td><td>${r.fraud_score}</td><td>${r.assignee||''}</td></tr>`).join('');document.querySelector('#timeline').innerHTML=d.timeline.slice(0,20).map(x=>`<li>${x.created_at} ${x.action} ${x.details}</li>`).join('')}load()</script></html>
+<script>
+const $=s=>document.querySelector(s);let state={claims:[],merges:[],evidence:[],timeline:[]};
+$('#user').value=localStorage.getItem('x-user')||'';$('#role').value=localStorage.getItem('x-role')||'';
+function headers(){return{'X-User':$('#user').value,'X-Role':$('#role').value,'Content-Type':'application/json'}}
+function saveAndLoad(){localStorage.setItem('x-user',$('#user').value);localStorage.setItem('x-role',$('#role').value);load()}
+function claimNo(id){const c=state.claims.find(c=>c.id===id);return c?c.claim_no:'#'+id}
+async function post(url,body){const r=await fetch(url,{method:'POST',headers:headers(),body:JSON.stringify(body)});const d=await r.json();if(!r.ok){$('#msg').textContent=d.error||'操作失败';return null}$('#msg').textContent='操作成功';return d}
+async function doMerge(c){const d=await post('/api/claims/merge',{primary_id:c.primary_id,secondary_id:c.secondary_id,expected_version:c.primary_version,secondary_version:c.secondary_version});if(d)load()}
+async function doUnmerge(m){const sec=state.claims.find(c=>c.id===m.secondary_id);if(!sec)return;const d=await post('/api/claims/unmerge',{secondary_id:m.secondary_id,expected_version:sec.version});if(d)load()}
+async function load(){
+  state=await fetch('/api/state',{headers:headers()}).then(r=>r.json());
+  document.querySelector('#claims tbody').innerHTML=state.claims.map(r=>`<tr><td>${r.claim_no}</td><td>${r.region}</td><td>${r.status}</td><td>${r.priority_score.toFixed(1)}</td><td>${r.fraud_score}</td><td>${r.assignee||''}</td><td>${r.merged_into?'并入 '+claimNo(r.merged_into):(r.merged_secondary_advance?'主案':'')}</td><td>${(r.emergency_advance+(r.merged_secondary_advance||0)).toFixed(0)}</td></tr>`).join('');
+  const active=state.merges.filter(m=>m.status==='active');
+  document.querySelector('#merges tbody').innerHTML=active.map(m=>`<tr><td>${claimNo(m.primary_id)}</td><td>${m.secondary_claim_no}</td><td>${m.merged_by}</td><td>${m.merged_at}</td><td><button onclick='doUnmerge(${JSON.stringify(m)})'>改判解除</button></td></tr>`).join('')||'<tr><td colspan="5" class="muted">无</td></tr>';
+  document.querySelector('#evidence tbody').innerHTML=state.evidence.map(e=>`<tr><td>${claimNo(e.claim_id)}</td><td>${e.origin_claim_no||'—'}</td><td>${e.filename}</td><td>${e.source}</td><td>${e.submitter}</td></tr>`).join('');
+  document.querySelector('#timeline').innerHTML=state.timeline.slice(0,20).map(x=>`<li>${x.created_at} ${x.action} ${x.details}</li>`).join('');
+  let cand={candidates:[]};
+  if(['supervisor','auditor'].includes($('#role').value)){cand=await fetch('/api/claims/merge-candidates',{headers:headers()}).then(r=>r.json()).catch(()=>({candidates:[]}))}
+  document.querySelector('#candidates tbody').innerHTML=cand.candidates.map(c=>`<tr><td>${c.primary_claim_no}</td><td>${c.secondary_claim_no}</td><td>${c.secondary_status}</td><td>${c.secondary_evidence}</td><td>${c.secondary_advance}</td><td class="${c.over_cap?'warn':''}">${c.advance_after_merge} / ${c.advance_cap}${c.over_cap?' 超上限':''}</td><td><button onclick='doMerge(${JSON.stringify(c)})'>并案</button></td></tr>`).join('')||'<tr><td colspan="7" class="muted">无可并案件</td></tr>';
+}
+load()</script></html>

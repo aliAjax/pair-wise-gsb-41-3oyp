@@ -12,6 +12,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+import merge_ops
+from merge_ops import MergeRuleError
+
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "catastrophe_claims.db"
 TERMINAL = {"duplicate", "approved", "rejected", "closed"}
@@ -103,6 +106,7 @@ class CatastropheClaimService:
                     emergency_advance REAL NOT NULL DEFAULT 0,
                     final_payout REAL,
                     duplicate_of INTEGER REFERENCES claims(id),
+                    merged_into INTEGER REFERENCES claims(id),
                     version INTEGER NOT NULL DEFAULT 1,
                     created_by TEXT NOT NULL,
                     created_at TEXT NOT NULL,
@@ -116,6 +120,7 @@ class CatastropheClaimService:
                     source TEXT NOT NULL,
                     submitter TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'received',
+                    origin_claim_no TEXT,
                     created_at TEXT NOT NULL,
                     UNIQUE(claim_id,sha256)
                 );
@@ -145,10 +150,41 @@ class CatastropheClaimService:
                     details TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS claim_merges (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    primary_id INTEGER NOT NULL REFERENCES claims(id),
+                    secondary_id INTEGER NOT NULL REFERENCES claims(id),
+                    secondary_claim_no TEXT NOT NULL,
+                    secondary_status TEXT NOT NULL,
+                    secondary_assignee TEXT,
+                    secondary_surveyor TEXT,
+                    secondary_duplicate_of INTEGER,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    merged_by TEXT NOT NULL,
+                    merged_at TEXT NOT NULL,
+                    undone_by TEXT,
+                    undone_at TEXT
+                );
                 CREATE INDEX IF NOT EXISTS idx_claims_queue ON claims(status, priority_score DESC, created_at);
                 CREATE INDEX IF NOT EXISTS idx_evidence_hash ON evidence(sha256);
                 """
             )
+            self._migrate_schema(conn)
+            conn.executescript(
+                """
+                CREATE INDEX IF NOT EXISTS idx_claims_merged ON claims(merged_into);
+                CREATE INDEX IF NOT EXISTS idx_claim_merges_secondary ON claim_merges(secondary_id, status);
+                """
+            )
+
+    def _migrate_schema(self, conn: sqlite3.Connection) -> None:
+        """老库补列：claims.merged_into 与 evidence.origin_claim_no。"""
+        claim_cols = {r["name"] for r in conn.execute("PRAGMA table_info(claims)")}
+        if "merged_into" not in claim_cols:
+            conn.execute("ALTER TABLE claims ADD COLUMN merged_into INTEGER REFERENCES claims(id)")
+        evidence_cols = {r["name"] for r in conn.execute("PRAGMA table_info(evidence)")}
+        if "origin_claim_no" not in evidence_cols:
+            conn.execute("ALTER TABLE evidence ADD COLUMN origin_claim_no TEXT")
 
     def _audit(self, conn: sqlite3.Connection, claim_id: int | None, actor: str, action: str, details: dict[str, Any]) -> None:
         conn.execute(
@@ -361,8 +397,8 @@ class CatastropheClaimService:
             limit = claim["estimated_loss"] * 0.2
             if amount <= 0 or amount > limit:
                 raise DomainError("预付金额必须大于0且不超过预估损失的20%", 409)
-            if claim["emergency_advance"] + amount > limit:
-                raise DomainError("累计预付超过上限", 409)
+            if merge_ops.group_emergency_advance(conn, claim_id) + amount > limit:
+                raise DomainError("累计预付超过上限（含已并入副案的预付）", 409)
             try:
                 conn.execute(
                     "INSERT INTO payments(claim_id,kind,amount,approved_by,reference,created_at) VALUES(?,?,?,?,?,?)",
@@ -409,6 +445,97 @@ class CatastropheClaimService:
             self._audit(conn, claim_id, actor, "claim.finalized", {"decision": decision, "payout": payout, "reason": reason.strip()})
             return dict(self._claim(conn, claim_id))
 
+    def merge_candidates(self, actor: str, role: str) -> dict[str, Any]:
+        actor_id(actor)
+        require_role(role, {"supervisor", "auditor"}, "查看并案候选")
+        with self.connect() as conn:
+            return {"candidates": merge_ops.find_merge_candidates(conn)}
+
+    def merge_claims(self, actor: str, role: str, primary_id: int, secondary_id: int,
+                     expected_version: int, secondary_version: int) -> dict[str, Any]:
+        """主管确认并案：副案并入主案，证据转挂并保留原案号，负责人与待办一起释放。"""
+        actor = actor_id(actor)
+        require_role(role, {"supervisor"}, "并案")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            primary = self._claim(conn, int(primary_id))
+            secondary = self._claim(conn, int(secondary_id))
+            if primary["version"] != int(expected_version) or secondary["version"] != int(secondary_version):
+                raise DomainError("案件已变化，请刷新后重试", 409)
+            merge_ops.assert_mergeable(primary, secondary, merge_ops.active_merge(conn, secondary["id"]))
+            origin_no = secondary["claim_no"]
+            moved, kept = merge_ops.migrate_evidence(conn, primary["id"], secondary["id"], origin_no)
+            now = utcnow()
+            conn.execute(
+                """INSERT INTO claim_merges(primary_id,secondary_id,secondary_claim_no,secondary_status,
+                   secondary_assignee,secondary_surveyor,secondary_duplicate_of,status,merged_by,merged_at)
+                   VALUES(?,?,?,?,?,?,?,'active',?,?)""",
+                (primary["id"], secondary["id"], origin_no, secondary["status"], secondary["assignee"],
+                 secondary["surveyor"], secondary["duplicate_of"], actor, now),
+            )
+            conn.execute(
+                """UPDATE claims SET claim_no=?,status='duplicate',duplicate_of=?,merged_into=?,
+                   assignee=NULL,surveyor=NULL,version=version+1,updated_at=? WHERE id=?""",
+                ("%s(并入%s)" % (origin_no, primary["claim_no"]), primary["id"], primary["id"], now, secondary["id"]),
+            )
+            conn.execute("UPDATE claims SET version=version+1,updated_at=? WHERE id=?", (now, primary["id"]))
+            advance_total = merge_ops.group_emergency_advance(conn, primary["id"])
+            self._audit(conn, primary["id"], actor, "claim.merged", {
+                "secondary_id": secondary["id"], "secondary_claim_no": origin_no,
+                "evidence_moved": len(moved), "evidence_kept": len(kept),
+                "absorbed_advance": secondary["emergency_advance"], "advance_total": advance_total,
+            })
+            self._audit(conn, secondary["id"], actor, "claim.merged_away", {
+                "primary_id": primary["id"], "primary_claim_no": primary["claim_no"],
+                "released_assignee": secondary["assignee"], "released_surveyor": secondary["surveyor"],
+            })
+            return {
+                "primary": dict(self._claim(conn, primary["id"])),
+                "secondary": dict(self._claim(conn, secondary["id"])),
+                "evidence_moved": len(moved),
+                "evidence_kept": len(kept),
+                "advance_total": advance_total,
+                "advance_cap": primary["estimated_loss"] * merge_ops.ADVANCE_CAP_RATIO,
+            }
+
+    def unmerge_claims(self, actor: str, role: str, secondary_id: int, expected_version: int) -> dict[str, Any]:
+        """并案改判：恢复两边原案号和责任，主案保留全部历史证据。"""
+        actor = actor_id(actor)
+        require_role(role, {"supervisor"}, "并案改判")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            secondary = self._claim(conn, int(secondary_id))
+            if secondary["version"] != int(expected_version):
+                raise DomainError("案件已变化，请刷新后重试", 409)
+            merge = merge_ops.active_merge(conn, secondary["id"])
+            if not merge or not secondary["merged_into"]:
+                raise DomainError("该案件没有进行中的并案", 409)
+            primary = self._claim(conn, merge["primary_id"])
+            if primary["status"] in merge_ops.FINALIZED:
+                raise DomainError("主案已核定结案，不能改判并案", 409)
+            now = utcnow()
+            conn.execute(
+                "UPDATE claim_merges SET status='undone',undone_by=?,undone_at=? WHERE id=?",
+                (actor, now, merge["id"]),
+            )
+            conn.execute(
+                """UPDATE claims SET claim_no=?,status=?,assignee=?,surveyor=?,duplicate_of=?,merged_into=NULL,
+                   version=version+1,updated_at=? WHERE id=?""",
+                (merge["secondary_claim_no"], merge["secondary_status"], merge["secondary_assignee"],
+                 merge["secondary_surveyor"], merge["secondary_duplicate_of"], now, secondary["id"]),
+            )
+            conn.execute("UPDATE claims SET version=version+1,updated_at=? WHERE id=?", (now, primary["id"]))
+            self._audit(conn, primary["id"], actor, "claim.unmerged", {
+                "secondary_id": secondary["id"], "restored_claim_no": merge["secondary_claim_no"],
+                "evidence_retained": True,
+            })
+            self._audit(conn, secondary["id"], actor, "claim.unmerge_restored", {
+                "primary_id": primary["id"], "restored_assignee": merge["secondary_assignee"],
+                "restored_surveyor": merge["secondary_surveyor"],
+            })
+            return {"primary": dict(self._claim(conn, primary["id"])),
+                    "secondary": dict(self._claim(conn, secondary["id"]))}
+
     def queue(self, role: str = "viewer", actor: str = "") -> list[dict[str, Any]]:
         if role not in {"intake", "supervisor", "adjuster", "surveyor", "auditor"}:
             raise DomainError("角色无权查看理赔队列", 403)
@@ -425,7 +552,7 @@ class CatastropheClaimService:
     def state(self, actor: str = "", role: str = "viewer") -> dict[str, Any]:
         allowed = role in {"intake", "supervisor", "adjuster", "surveyor", "auditor"}
         if not allowed:
-            return {"claims": [], "evidence": [], "payments": [], "timeline": [], "access_limited": True}
+            return {"claims": [], "evidence": [], "payments": [], "timeline": [], "merges": [], "access_limited": True}
         with self.connect() as conn:
             if role in {"adjuster", "surveyor"}:
                 claims = [dict(r) for r in conn.execute(
@@ -433,15 +560,24 @@ class CatastropheClaimService:
                 ).fetchall()]
             else:
                 claims = [dict(r) for r in conn.execute("SELECT * FROM claims ORDER BY priority_score DESC,id DESC").fetchall()]
+            absorbed = {r["merged_into"]: r["total"] for r in conn.execute(
+                "SELECT merged_into, SUM(emergency_advance) AS total FROM claims WHERE merged_into IS NOT NULL GROUP BY merged_into"
+            ).fetchall()}
+            for claim in claims:
+                claim["merged_secondary_advance"] = absorbed.get(claim["id"], 0.0)
             ids = [c["id"] for c in claims]
             if ids:
                 marks = ",".join("?" for _ in ids)
                 evidence = [dict(r) for r in conn.execute("SELECT * FROM evidence WHERE claim_id IN (%s) ORDER BY id DESC" % marks, ids).fetchall()]
                 payments = [dict(r) for r in conn.execute("SELECT * FROM payments WHERE claim_id IN (%s) ORDER BY id DESC" % marks, ids).fetchall()]
                 timeline = [dict(r) for r in conn.execute("SELECT * FROM timeline WHERE claim_id IN (%s) ORDER BY id DESC LIMIT 300" % marks, ids).fetchall()]
+                merges = [dict(r) for r in conn.execute(
+                    "SELECT * FROM claim_merges WHERE primary_id IN (%s) OR secondary_id IN (%s) ORDER BY id DESC LIMIT 100" % (marks, marks),
+                    ids + ids,
+                ).fetchall()]
             else:
-                evidence, payments, timeline = [], [], []
-        return {"claims": claims, "evidence": evidence, "payments": payments, "timeline": timeline, "access_limited": False}
+                evidence, payments, timeline, merges = [], [], [], []
+        return {"claims": claims, "evidence": evidence, "payments": payments, "timeline": timeline, "merges": merges, "access_limited": False}
 
     def seed_demo(self) -> dict[str, Any]:
         with self.connect() as conn:
@@ -498,9 +634,14 @@ class ApiHandler(BaseHTTPRequestHandler):
             elif path == "/api/queue":
                 actor, role = self._headers()
                 self._send(200, {"queue": self.service.queue(role, actor)})
+            elif path == "/api/claims/merge-candidates":
+                actor, role = self._headers()
+                self._send(200, self.service.merge_candidates(actor, role))
             else:
                 self._send(404, {"error": "接口不存在"})
         except DomainError as exc:
+            self._send(exc.status, {"error": str(exc)})
+        except MergeRuleError as exc:
             self._send(exc.status, {"error": str(exc)})
 
     def do_POST(self) -> None:
@@ -522,10 +663,16 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.emergency_advance(actor, role, **data)
             elif path == "/api/claims/finalize":
                 result = self.service.finalize_claim(actor, role, **data)
+            elif path == "/api/claims/merge":
+                result = self.service.merge_claims(actor, role, **data)
+            elif path == "/api/claims/unmerge":
+                result = self.service.unmerge_claims(actor, role, **data)
             else:
                 raise DomainError("接口不存在", 404)
             self._send(201, result)
         except DomainError as exc:
+            self._send(exc.status, {"error": str(exc)})
+        except MergeRuleError as exc:
             self._send(exc.status, {"error": str(exc)})
         except (KeyError, TypeError, ValueError) as exc:
             self._send(400, {"error": "请求参数错误: %s" % exc})

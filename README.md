@@ -23,8 +23,13 @@ python3 app.py
 - `POST /api/claims/assign`：分配查勘人员
 - `POST /api/evidence`：添加证据并识别跨案件批量复用
 - `POST /api/claims/survey`、`POST /api/claims/submit-review`
-- `POST /api/claims/emergency-advance`：仅限监督人员、紧急且未超20%的案件
+- `POST /api/claims/emergency-advance`：仅限监督人员、紧急且未超20%的案件（已并入副案的预付计入主案上限）
 - `POST /api/claims/finalize`：锁定最终核定结果
+- `GET /api/claims/merge-candidates`：主管查看可并案对，预演证据数量与预付两成上限
+- `POST /api/claims/merge`：主管确认并案，副案证据转挂主案并保留原案号，副案负责人与待办一起释放
+- `POST /api/claims/unmerge`：并案改判，恢复两边原案号和责任，主案保留全部历史证据
+
+并案归并规则、证据迁移与付款校验在 `merge_ops.py`，接口在 `app.py`，页面在 `static/index.html`，彼此分开实现。
 
 ## 测试
 
@@ -32,7 +37,7 @@ python3 app.py
 python3 -m unittest discover -s tests -v
 ```
 
-测试覆盖完整赔付流程、重复报案、乐观锁冲突、批量伪证识别和角色权限。
+测试覆盖完整赔付流程、重复报案、乐观锁冲突、批量伪证识别、角色权限，以及并案归并、证据迁移保留原案号、副案预付计入主案上限和改判恢复。
 
 ## 局限
 
